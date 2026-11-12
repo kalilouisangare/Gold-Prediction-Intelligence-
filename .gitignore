@@ -1,0 +1,43 @@
+# --- Données et sorties (ne jamais versionner) ---
+gold_data/
+data/raw/
+*.csv
+!tests/fixtures/*.csv
+*.parquet
+*.feather
+
+# --- Secrets ---
+.env
+.env.*
+!.env.example
+*.key
+secrets.*
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+.python-version
+
+# --- Outils ---
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.ipynb_checkpoints/
+
+# --- IDE / OS ---
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# --- uv ---
+# uv.lock EST versionné (reproductibilité), ne pas l'ignorer
