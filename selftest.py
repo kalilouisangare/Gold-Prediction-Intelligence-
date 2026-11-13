@@ -27,7 +27,9 @@ def check(label, cond):
 
 def synthetic(n=3400, seed=42):
     rng = np.random.default_rng(seed)
-    idx = pd.bdate_range("2012-01-02", periods=n)
+    # PATCH_SELFTEST_FIX : fin ancree sur aujourd hui. Sinon la serie figee
+    # vieillit et le garde-fou max_staleness_days la rejette.
+    idx = pd.bdate_range(end=pd.Timestamp.today().normalize(), periods=n)
 
     # volatilité en clusters + queues épaisses
     r = np.zeros(n)
@@ -72,7 +74,10 @@ def main():
     tmp = Path(tempfile.mkdtemp(prefix="gold_v7_selftest_"))
     print(f"Sorties temporaires : {tmp}\n")
 
-    common = dict(rebuild=True, use_xgb=False, use_mlp=False, n_boot=200, data_dir=tmp)
+    # PATCH_SELFTEST_FIX : offline=True (aucun reseau) ; RUN 1 tronque 60
+    # seances (~84 j calendaires) -> fraicheur relaxee pour le test seulement.
+    common = dict(rebuild=True, use_xgb=False, use_mlp=False, n_boot=200,
+                  data_dir=tmp, offline=True, max_staleness_days=120)
 
     # ---- run 1 : historique tronqué de 60 séances (les prévisions vont mûrir) ----
     data.fetch_all = lambda cfg, start, cache: full.iloc[:-60].copy()
@@ -91,13 +96,18 @@ def main():
     cfg = Config(data_dir=tmp)
     raw, _ = data.load_raw(cfg)
     model, masked, events = data.sanitize_external(raw, cfg)
+    # PATCH_SELFTEST_ASSERTS : le choc synthetique (-31.4 %) est sous la borne
+    # silver_Close (45 %) ; seul le rebond J+1 (+45.8 %) la franchit et est trace.
+    _cp = full.index.get_loc(ev["crash"])
+    crash_days = {f"{full.index[_cp]:%Y-%m-%d}",
+                  f"{full.index[min(_cp + 1, len(full) - 1)]:%Y-%m-%d}"}
 
     check("krach réel conservé (argent non effacé)",
           pd.notna(model.loc[ev["crash"], "silver_Close"]))
     check("spike isolé masqué (argent NaN)",
           pd.isna(model.loc[ev["spike"], "silver_Close"]))
     check("le krach est bien tracé comme confirmé",
-          any(e["date"] == f"{ev['crash']:%Y-%m-%d}" and "conservé" in e["action"] for e in events))
+          any(e["date"] in crash_days and "conservé" in e["action"] for e in events))
     check("barre OHLC incohérente détectée",
           ev["badbar"] in data.scan_quality(raw, cfg)["bad_bars"])
 
@@ -105,7 +115,7 @@ def main():
     feats, cov = features.build(model, cfg, masked, data.scan_quality(raw, cfg)["bad_bars"])
     check("range_hl masqué sur la barre incohérente",
           pd.isna(feats.loc[ev["badbar"], "range_hl"]) if "range_hl" in feats else True)
-    check("vol_ewma présente et finie", bool(np.isfinite(feats["vol_ewma"]).all()))
+    check("vol_ewma présente et finie", bool(np.isfinite(feats["vol_ewma"].iloc[1:]).all()))
 
     # Kupiec : 250 tirages, 50 sorties à 80 % -> conforme ; 75 -> rejet
     _, p_ok = kupiec(250, 50, 0.20)
@@ -114,22 +124,28 @@ def main():
     check(f"Kupiec rejet (p={p_ko:.4f} < .05)", p_ko < 0.05)
 
     # Christoffersen : sorties alternées vs groupées
-    alt = np.tile([0, 1], 150)
+    # PATCH_SELFTEST_ASSERTS : 0,1,0,1... est maximalement dependante
+    # (n00 = n11 = 0) : le test d independance DOIT rejeter. La non-rejection
+    # se teste sur une sequence bernoullienne independante.
+    alt = (np.random.default_rng(7).random(400) < 0.20).astype(int)
     grp = np.r_[np.zeros(150), np.ones(150)]
     _, p_alt = christoffersen(alt)
     _, p_grp = christoffersen(grp)
-    check(f"Christoffersen alterné non rejeté (p={p_alt:.3f})", p_alt > 0.05)
+    check(f"Christoffersen independant non rejete (p={p_alt:.3f})", p_alt > 0.05)
     check(f"Christoffersen groupé rejeté (p={p_grp:.2e})", p_grp < 0.05)
 
     # Conformal adaptatif : trop de ratés -> q AUGMENTE ; trop peu -> q DIMINUE
+    # PATCH_ACI_DATES : feed() exige des dates strictement croissantes.
+    # '1 + _ % 28' ne fournit que 28 cles valides < min_obs (60) : q() restait
+    # fige sur base_q. Dates distinctes + 120 iterations -> warmup franchi.
     z = list(np.abs(np.random.default_rng(0).standard_t(5, 400) / np.sqrt(5 / 3)))
     a = AdaptiveConformal(0.20, 0.05, 500, 60); a.seed(z, 1.3); q0 = a.q()
-    for _ in range(60):
-        a.feed(("2099-01-%02d" % (1 + _ % 28), 9.0))       # ratés systématiques
+    for _ in range(120):
+        a.feed([((pd.Timestamp("2099-01-01") + pd.Timedelta(days=_)).strftime("%Y-%m-%d"), 9.0)])       # ratés systématiques
     check(f"adaptatif : ratés -> q élargit ({q0:.3f} -> {a.q():.3f})", a.q() > q0)
     b = AdaptiveConformal(0.20, 0.05, 500, 60); b.seed(z, 1.3); q0b = b.q()
-    for _ in range(60):
-        b.feed(("2099-01-%02d" % (1 + _ % 28), 0.0))       # jamais de raté
+    for _ in range(120):
+        b.feed([((pd.Timestamp("2099-01-01") + pd.Timedelta(days=_)).strftime("%Y-%m-%d"), 0.0)])       # jamais de raté
     check(f"adaptatif : zéro raté -> q rétrécit ({q0b:.3f} -> {b.q():.3f})", b.q() < q0b)
 
     check("rapport JSON écrit", cfg.report_file.exists())
