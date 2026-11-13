@@ -8,6 +8,7 @@ MODEL_VERSION = "v7.0"
 
 SOURCE_TAGS = {
     "yahoo": "gc_futures",
+    "investing":     "xauusd_spot_investing",     # <-- NOUVEAU
     "netdania_csv": "xauusd_spot_netdania",
     "google_csv": "xauusd_spot_google",
     "alphavantage": "xauusd_spot_alphavantage",
@@ -27,6 +28,14 @@ class Config:
     use_cache: bool = True
     refresh: bool = False
     rebuild: bool = False
+    drop_global_holidays: bool = True
+
+    # --- Investing.com ----------------------------------------------------
+    investing_id: int = 68             # XAU/USD spot (pair_ID=68)
+    investing_resolution: str = "D"
+    investing_domain_id: str = "www"
+    investing_date_shift: int = 0      # +1 ou -1 si l'audit détecte un décalage
+    investing_use_udf: bool = False    # Cloudflare renvoie 403 en permanence
 
     # --- données ---------------------------------------------------------
     start: str = "2010-01-01"
@@ -43,6 +52,7 @@ class Config:
     max_revision_pct: float = 2.0          # % : au-delà, on alerte et on garde l'historique
     ny_close_buffer: tuple[int, int] = (17, 30)
     max_staleness_days: int = 7
+    offline: bool = False   # PATCH_SELFTEST_FIX : interdit toute I/O reseau
     max_feature_staleness_rows: int = 2
 
     # --- qualité (détection, jamais destruction d'un fait de marché) -----
@@ -55,7 +65,7 @@ class Config:
     block_on_alert: bool = False
 
     # --- audit multi-sources --------------------------------------------
-    audit_sources: tuple = ("netdania_csv", "google_csv", "alphavantage")
+    audit_sources: tuple = ("yahoo", "investing", "netdaria_csv", "alphavantage")
     audit_window_days: int = 3 * 365
     divergence_warn_pct: float = 0.75
 
@@ -63,6 +73,7 @@ class Config:
     external_lag: int = 1                  # clôtures externes postérieures au settlement or
     external_ffill_limit: int = 3
     min_feature_coverage: float = 0.90
+    max_zero_fraction: float = 0.50   # PATCH_DEGEN : >50 % de zeros exacts = ecartee
     drift_window: int = 60
 
     # --- validation ------------------------------------------------------

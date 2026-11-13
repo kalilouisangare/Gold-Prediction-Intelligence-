@@ -89,6 +89,15 @@ def build(model: pd.DataFrame, cfg: Config, masked: dict, bad_bars: list) -> tup
     if "vol_ewma" not in keep:
         raise RuntimeError("vol_ewma indisponible : historique de l'or insuffisant.")
     f = f[keep]
+    # PATCH_DEGEN : variable quasi-constante = artefact fournisseur, pas un fait de marche
+    degen = []
+    for c_ in f.columns:
+        s_ = f[c_].dropna()
+        if len(s_) >= 100 and (s_ == 0).mean() > getattr(cfg, "max_zero_fraction", 0.50):
+            degen.append(c_)
+    if degen:
+        print(f"[FEATURES] variables degenerees ecartees : {degen}")
+        f = f.drop(columns=degen)
     stale = [c_ for c_ in f.columns if c_ != "vol_ewma" and pd.isna(f[c_].iloc[-1])]
     if stale:
         print(f"[FEATURES] variables sans valeur à la dernière date, écartées : {stale}")

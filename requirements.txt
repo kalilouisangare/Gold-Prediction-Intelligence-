@@ -12,3 +12,5 @@ tabulate[widechars]>=0.9
 
 # Optionnel : source alphavantage
 requests>=2.31
+
+curl_cffi>=0.7

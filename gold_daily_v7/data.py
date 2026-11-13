@@ -7,6 +7,10 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 
+import json
+import time
+import uuid
+
 from .config import SOURCE_TAGS, TICKERS, Config
 
 
@@ -130,6 +134,205 @@ class YahooCache:
                 print(f"[Yahoo] {ticker}: téléchargement échoué, repli sur le cache.")
                 return d
         return pd.DataFrame()
+
+UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+      "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
+
+
+def _http_get(url, params, headers, timeout=60, retries=3):
+    """Requête HTTP avec TLS imitant Chrome (curl_cffi) pour passer Cloudflare."""
+    last = None
+    for i in range(retries):
+        try:
+            try:
+                from curl_cffi import requests as creq
+                r = creq.get(url, params=params, headers=headers,
+                             impersonate="chrome", timeout=timeout)
+            except ImportError:
+                import requests as req
+                r = req.get(url, params=params, headers=headers, timeout=timeout)
+            return r.status_code, r.text
+        except Exception as exc:
+            last = str(exc)
+            time.sleep(1.5 * (i + 1))
+    raise RuntimeError(f"HTTP {url} : {last}")
+
+
+def _walk_rows(obj):
+    if isinstance(obj, dict):
+        if "rowDate" in obj:
+            yield obj
+        for v in obj.values():
+            yield from _walk_rows(v)
+    elif isinstance(obj, list):
+        for v in obj:
+            yield from _walk_rows(v)
+
+
+def _investing_udf(investing_id, start, end, resolution="D", chunk_days=6900):
+    """Endpoint rapide : t/o/h/l/c/v. Chunking auto (limite ~6940 j)."""
+    t0 = pd.Timestamp(start, tz="UTC")
+    t1 = pd.Timestamp(end, tz="UTC") + pd.Timedelta(days=1)
+    frames, cur = [], t0
+    while cur < t1:
+        nxt = min(cur + pd.Timedelta(days=chunk_days), t1)
+        url = f"https://tvc6.investing.com/{uuid.uuid4().hex}/0/0/0/0/history"
+        headers = {"User-Agent": UA,
+                   "Referer": "https://tvc-invdn-com.investing.com/",
+                   "Origin": "https://tvc-invdn-com.investing.com",
+                   "Accept": "application/json"}
+        code, body = _http_get(url, {
+            "symbol": investing_id,
+            "from": int(cur.timestamp()),
+            "to": int(nxt.timestamp()),
+            "resolution": resolution,
+        }, headers)
+        if code != 200:
+            raise RuntimeError(f"UDF HTTP {code}")
+        try:
+            d = json.loads(body)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"UDF non JSON : {exc}") from exc
+        if isinstance(d, dict) and d.get("s") == "ok" and d.get("t"):
+            n = len(d["t"])
+            frames.append(pd.DataFrame({
+                "t": d["t"], "Open": d["o"], "High": d["h"],
+                "Low": d["l"], "Close": d["c"],
+                "Volume": d.get("v", [0] * n),
+            }))
+        elif not (isinstance(d, dict) and d.get("s") == "no_data"):
+            raise RuntimeError(f"UDF réponse inattendue : {str(d)[:120]}")
+        cur = nxt + pd.Timedelta(seconds=1)
+    if not frames:
+        return pd.DataFrame()
+    df = pd.concat(frames)
+    idx = pd.to_datetime(df.pop("t"), unit="s", utc=True) \
+            .tz_convert("UTC").tz_localize(None).normalize()
+    df.index = idx
+    cols = [c for c in ("Open", "High", "Low", "Close", "Volume") if c in df.columns]
+    df = df[cols]
+    if "Volume" in df.columns and (df["Volume"].fillna(0) == 0).all():
+        df = df.drop(columns=["Volume"])
+    return df[~df.index.duplicated(keep="last")].sort_index()
+
+
+def _investing_rest(investing_id, start, end, domain_id="www"):
+    """Repli : api.investing.com/api/financialdata/historical."""
+    url = f"https://api.investing.com/api/financialdata/historical/{investing_id}"
+    params = {"start-date": start, "end-date": end,
+              "time-frame": "Daily", "add-missing-rows": "false"}
+    headers = {"User-Agent": UA, "domain-id": domain_id,
+               "Accept": "application/json",
+               "Referer": "https://www.investing.com/"}
+    code, body = _http_get(url, params, headers, timeout=90)
+    if code != 200:
+        raise RuntimeError(f"REST HTTP {code}")
+    rows = list(_walk_rows(json.loads(body)))
+    if not rows:
+        raise RuntimeError("REST : aucune ligne")
+    m = {"last_close": "Close", "last_open": "Open", "last_max": "High",
+         "last_min": "Low", "volume": "Volume", "rowDate": "Date"}
+    df = pd.DataFrame([{m[k]: v for k, v in r.items() if k in m} for r in rows])
+    df.index = pd.to_datetime(df.pop("Date"), format="%b %d, %Y", errors="coerce")
+    df.index = pd.DatetimeIndex(df.index).normalize()
+    for c in df.columns:
+        df[c] = pd.to_numeric(df[c].astype(str).str.replace(",", ""), errors="coerce")
+    return df[df.index.notna() & (df["Close"] > 0)].sort_index()
+
+
+class InvestingCache:
+    """Même contrat que YahooCache : .download(ticker, start) -> DataFrame OHLC."""
+
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+
+    def path(self, ticker: str) -> Path:
+        safe = ticker.replace("=", "_").replace("^", "").replace(":", "_")
+        return self.cfg.cache_dir / f"investing_{safe}.csv"
+
+    def read(self, ticker: str, start: str) -> pd.DataFrame:
+        p = self.path(ticker)
+        if not p.exists():
+            return pd.DataFrame()
+        try:
+            d = normalise_daily_index(pd.read_csv(p, index_col=0, parse_dates=True))
+        except Exception:
+            return pd.DataFrame()
+        if d.empty:
+            return d
+        d = _numeric(d)
+        return d.loc[d.index >= pd.Timestamp(start)].sort_index()
+
+    def write(self, ticker: str, df: pd.DataFrame) -> None:
+        if df.empty:
+            return
+        try:
+            self.cfg.cache_dir.mkdir(parents=True, exist_ok=True)
+            old = self.read(ticker, "1900-01-01")
+            merged = df if old.empty else df.combine_first(old).sort_index()
+            merged.to_csv(self.path(ticker))
+        except Exception as exc:
+            print(f"[CACHE investing] {ticker}: écriture impossible ({exc}).")
+
+    def fresh(self, ticker: str) -> bool:
+        p = self.path(ticker)
+        if not p.exists():
+            return False
+        age = pd.Timestamp.now(tz="UTC") - pd.to_datetime(
+            p.stat().st_mtime, unit="s", utc=True)
+        return age < pd.Timedelta(hours=self.cfg.cache_ttl_hours)
+
+    def download(self, ticker: str, start: str, prefer_cache: bool = True) -> pd.DataFrame:
+        cfg = self.cfg
+        if cfg.use_cache and prefer_cache and not cfg.refresh and self.fresh(ticker):
+            d = self.read(ticker, start)
+            if not d.empty and "Close" in d.columns:
+                return d
+
+        investing_id = getattr(cfg, "investing_id", 68)
+        end = pd.Timestamp.now(tz="UTC").strftime("%Y-%m-%d")
+        df = pd.DataFrame()
+        last_err = None
+
+
+        if getattr(cfg, "investing_use_udf", True):
+            try:
+                df = _investing_udf(investing_id, start, end, cfg.investing_resolution)
+            except Exception as exc:
+                last_err = f"UDF: {exc}"
+                print(f"[Investing/{ticker}] UDF échoué ({exc}) -> REST")
+
+        if df.empty:
+            try:
+                df = _investing_rest(investing_id, start, end, cfg.investing_domain_id)
+            except Exception as exc:
+                print(f"[Investing/{ticker}] tous endpoints échoués : {last_err} ; REST: {exc}")
+                if cfg.use_cache:
+                    d = self.read(ticker, start)
+                    if not d.empty and "Close" in d.columns:
+                        print(f"[Investing] {ticker}: repli cache.")
+                        return d
+                return pd.DataFrame()
+                df = _numeric(normalise_daily_index(df))
+        # aligne sur la convention de read_local_csv : lun-ven uniquement
+        df = df[df.index.day_of_week < 5]
+        # or spot fermé mondialement : 1er janvier et 25 décembre
+        if getattr(cfg, "drop_global_holidays", True):
+            hol = (df.index.month == 1) & (df.index.day == 1)
+            hol |= (df.index.month == 12) & (df.index.day == 25)
+            if hol.any():
+                print(f"[Investing] {int(hol.sum())} barre(s) de jour férié mondial retirée(s).")
+                df = df[~hol]
+        # le spot OTC ne publie pas de volume : colonne vide = poids mort
+        if "Volume" in df.columns and df["Volume"].isna().all():
+            df = df.drop(columns=["Volume"])  # PATCH_VOLUME_SPOT
+        shift = getattr(cfg, "investing_date_shift", 0)
+        if shift:
+            df.index = df.index.shift(shift, "D")
+            df = df.sort_index()
+        if cfg.use_cache:
+            self.write(ticker, df)
+        return df
 
 
 # --------------------------------------------------------------- CSV local ---
@@ -268,7 +471,9 @@ def fetch_alphavantage(cfg: Config, start: str) -> pd.DataFrame:
 def fetch_gold(cfg: Config, start: str, cache: YahooCache) -> pd.DataFrame:
     if cfg.source == "yahoo":
         return cache.download(cfg.gold_ticker, start, prefer_cache=False)
-    if cfg.source == "netdania_csv":
+    if cfg.source == "investing":
+        return InvestingCache(cfg).download(cfg.gold_ticker, start, prefer_cache=False)
+    if cfg.source == "netdaria_csv":
         g = read_local_csv(cfg.netdania_csv, "NetDania", cfg, True, cfg.netdania_tz)
     elif cfg.source == "google_csv":
         g = read_local_csv(cfg.google_csv, "Google Finance", cfg)
@@ -444,6 +649,8 @@ def audit_sources(raw: pd.DataFrame, cfg: Config) -> dict:
     for src in candidates:
         if src == cfg.source:
             continue
+        if getattr(cfg, "offline", False) and src in ("yahoo", "investing", "tradingview"):
+            continue  # PATCH_SELFTEST_FIX : aucune I/O reseau en mode hors-ligne
         try:
             if src == "gld_witness":
                 close = raw["gld_Close"]
@@ -456,6 +663,14 @@ def audit_sources(raw: pd.DataFrame, cfg: Config) -> dict:
                 close = read_local_csv(cfg.google_csv, "Google", cfg, verbose=False)["Close"]
             elif src == "alphavantage" and cfg.alphavantage_csv.exists():
                 close = read_local_csv(cfg.alphavantage_csv, "AlphaVantage", cfg, verbose=False)["Close"]
+            elif src == "investing":
+                try:
+                    inv = InvestingCache(cfg)
+                    d = inv.download("XAUUSD_audit", start.strftime("%Y-%m-%d"))
+                    close = d.get("Close") if not d.empty else None
+                except Exception as exc:
+                    print(f"[AUDIT] investing : {exc}")
+                    continue
             else:
                 continue
         except Exception as exc:

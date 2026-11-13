@@ -612,3 +612,51 @@ comparaison de couverture sur bloc tenu à l'écart, et `python selftest.py` doi
 - **Aucune clé API n'est versionnée.** `ALPHAVANTAGE_API_KEY` est lue dans l'environnement ;
   `.env` est ignoré.
 - Le journal de prévisions est personnel : il n'a pas vocation à être publié.
+
+---
+
+## Source Investing.com (XAU/USD spot)
+
+Commande :
+
+    python -m gold_daily_v7 --source investing --rebuild
+
+Identifiant `pair_ID = 68`. L'endpoint UDF `tvc6.investing.com` est desactive par
+defaut (`investing_use_udf = False`) car Cloudflare renvoie 403 ; repli automatique
+sur `api.investing.com/api/financialdata/historical` (en-tete `domain-id: www`).
+`curl_cffi` imite l'empreinte TLS de Chrome.
+
+### Garde-fous propres a cette source
+
+- week-ends exclus (alignement sur `read_local_csv`)
+- 1er janvier et 25 decembre exclus : or spot ferme mondialement, 5 barres retirees
+- colonne `Volume` supprimee : spot OTC, 100 % NaN
+- `gap_open` ecartee par le garde-fou de degenerescence (`max_zero_fraction = 0.50`) :
+  83,6 % de zeros exacts, annees 2015/2017/2020/2021 entierement nulles, reveil 2024.
+  Artefact de convention fournisseur (ouverture = cloture veille) avec rupture de
+  regime : marqueur temporel deguise, pas un fait de marche.
+
+### Resultats observes (run du 13/11/2026)
+
+4 361 seances (2010-01-04 -> 2026-11-12), **31 variables**, `EXTERNAL_LAG = 1`.
+Audit croise : GLD lag +0 (ecart 0,04 %), Yahoo GC=F lag +0 (ecart 0,10 %).
+Une seule alerte qualite : le choc reel du 30/01/2026 (-9,8 %), conserve.
+
+| Horizon | Couv. 80 % | Couv. 90 % | MAE naive |
+| --- | --- | --- | --- |
+| 1 | 80,9 % | 91,0 % | 0,69 % |
+| 2 | 79,1 % | 90,4 % | 1,01 % |
+| 5 | 80,1 % | 91,5 % | 1,60 % |
+
+**Aucun modele ne bat les deux baselines.** Decision NEUTRAL sur les 3 horizons.
+
+Comparaison a Yahoo GC=F : 25 barres OHLC incoherentes -> 1, couverture `range_hl`
+96,1 % -> 100 %, calibration 80 % h=1 78,3 % -> 80,9 %. Le MAE passe de 0,73 % a
+0,69 % mais **la baseline naive baisse identiquement** : actif different (spot vs
+future), pas un gain de skill.
+
+### Limites
+
+Les CGU d'Investing.com interdisent l'acces automatise : usage personnel / recherche.
+Les ~119 NaN sur les series externes sont les jours feries US ou le spot cote mais
+pas le COMEX/NYSE ; combles par `ffill(limit=3)`, couverture 99,9 %. A ne pas corriger.
