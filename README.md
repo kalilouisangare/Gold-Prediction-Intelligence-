@@ -78,8 +78,8 @@ Trois engagements, appliqués dans le code :
 Prérequis : **Python ≥ 3.10** (développé et testé sur 3.14).
 
 ```bash
-git clone https://github.com/TON_USER/TON_REPO.git
-cd TON_REPO
+git clone https://github.com/kalilouisangare/Gold-Prediction-Intelligence-.git
+cd Gold-Prediction-Intelligence-
 
 # avec uv (recommandé)
 uv venv
